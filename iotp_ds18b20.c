@@ -7,6 +7,7 @@
 #include "iotp_wifi.h"
 
 #include "iotp_ds18b20.h"
+#include "freertos/event_groups.h"
 
 static const char *TAG = "LOGGER";
 
@@ -20,13 +21,15 @@ static const char *DS18B20_ERROR_MSG_UNKNOWN = "unknownError";
 
 #define MAX_DEVICES (8)
 
-iotp_ds18b20_handle_t iotp_ds18b20_init(esp_mqtt_client_handle_t mqtt_client, uint8_t gpio_pin) {
+iotp_ds18b20_handle_t iotp_ds18b20_init(esp_mqtt_client_handle_t mqtt_client, uint8_t gpio_pin, iotp_ds18b20_update update_cb) {
     iotp_ds18b20_t *state = malloc(sizeof(iotp_ds18b20_t));
     state->mqtt_client = mqtt_client;
-    state->connected = false;
     state->gpio_pin = gpio_pin;
+    state->update_cb = update_cb;
+    state->connected = false;
     state->resolution = DS18B20_RESOLUTION_12_BIT;
     state->interval = 1000;
+    state->ntp_synced = false;
 
     return state;
 }
@@ -37,6 +40,12 @@ int iotp_ds18b20_get_connected(iotp_ds18b20_handle_t state) {
 
 void iotp_ds18b20_set_connected(iotp_ds18b20_handle_t state, int connected) {
     state->connected = connected;
+}
+
+void iotp_ds18b20_set_ntp(iotp_ds18b20_handle_t handle, bool synced) {
+    iotp_ds18b20_t *state = (iotp_ds18b20_t*)handle;
+    ESP_LOGI(TAG, "NTP set to %s", synced ? "synced" : "unsynced");
+    state->ntp_synced = synced;
 }
 
 void iotp_ds18b20_task(void *pParam)
@@ -143,11 +152,8 @@ void iotp_ds18b20_task(void *pParam)
         ESP_LOGI(TAG, "WiFi state after initial wait is %s.", wifi_connected ? "connected" : "not connected");
 
         TickType_t last_wake_time = xTaskGetTickCount();
-
         while (true)
         {
-            last_wake_time = xTaskGetTickCount();
-
             ds18b20_convert_all(owb);
 
             // In this application all devices use the same resolution,
@@ -162,6 +168,11 @@ void iotp_ds18b20_task(void *pParam)
             for (int i = 0; i < num_devices; ++i)
             {
                 errors[i] = ds18b20_read_temp(devices[i], &readings[i]);
+            }
+
+            // Call the update callback with the first reading
+            if (num_devices == 1 && state->update_cb != NULL) {
+                state->update_cb(readings[0]);
             }
 
             // Check that wifi is still connected
@@ -220,7 +231,7 @@ void iotp_ds18b20_task(void *pParam)
                 ESP_LOGI(TAG, "WiFi not connected, skipping publish...");
             }
 
-            vTaskDelayUntil(&last_wake_time, state->resolution / portTICK_PERIOD_MS);
+            vTaskDelayUntil(&last_wake_time, state->interval / portTICK_PERIOD_MS);
         }
     }
 
